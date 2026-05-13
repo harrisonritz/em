@@ -18,11 +18,15 @@ Fit a model using expectation-maximization.
 - `quiet=10`: print updates every N iterations (or 0: never)
 - `startx=X*betas`: starting points for per-subject parameters
 - `prior=nothing`: optional matrix-normal inverse-Wishart hyperprior on the group-level
-  coefficients and covariance. Pass a NamedTuple `(M=..., Lambda=..., nu=..., Psi=...)` where
+  coefficients and covariance, giving the strict joint MAP M-step. Pass a NamedTuple
+  `(M=..., Lambda=..., nu=..., Psi=...)` where
     - `M` is the prior mean for `betas`, size `(nreg, nparam)`
     - `Lambda` is the prior row-precision over regressors, size `(nreg, nreg)`, positive definite (larger => stronger shrinkage of `betas` toward `M`)
     - `nu` is the inverse-Wishart degrees of freedom (scalar, `> nparam - 1`)
     - `Psi` is the inverse-Wishart scale matrix for `sigma`, size `(nparam, nparam)`, positive definite
+  The MAP update is
+    `betas  = (X'X + Lambda) \\ (X'x + Lambda*M)`
+    `sigma  = (Psi + (x - X*betas)'(x - X*betas) + (betas - M)'*Lambda*(betas - M) + sum(h)) / (nu + nsub + nreg + nparam + 1)`
   With `prior=nothing` (default) the original MLE M-step is used. When `full=false` the
   MAP `sigma` is diagonalized.
 
@@ -103,33 +107,59 @@ function em(data,subs,X,betas,sigma,likfun; emtol=1e-3, startx = [], maxiter=100
 end
 
 # experimental function to generate starting points for em()
+#
+# When `prior` is supplied (a matrix-normal inverse-Wishart NamedTuple), each subject's
+# regularizer is the prior predictive distribution for x_i under the hyperprior:
+#   mu_i    = X[i,:] * prior.M
+#   sigma_i = (1 + X[i,:]' * Lambda^{-1} * X[i,:]) * prior.Psi / (prior.nu + nparam + 1)
+# (Gaussian approximation at the prior mode of Sigma, marginalizing beta from the MN prior).
+# The inflation factor (1 + X_i'Lambda^{-1}X_i) lets a weak Lambda widen the prior
+# automatically, so this should not over-regularize.
 
-function eminits(data,subs,X,betas,sigma::Vector,likfun;nstarts=10)
+function eminits(data,subs,X,betas,sigma::Vector,likfun; nstarts=10, prior=nothing)
 	nsub = size(X,1)
     nparam = size(betas,2)
+	nreg = size(X,2)
+
+	validate_prior(prior, nreg, nparam)
 
 	x = zeros(nsub,nparam)
 	l = zeros(nsub) .+ Inf
 
-	startx = zeros(nstarts,nparam)
+	# precompute per-subject Gaussian prior (mu_i, sigma_i)
+	if prior === nothing
+		mu_subs = X * betas
+		sigma_subs = fill(Diagonal(sigma), nsub)
+	else
+		sigma_mode = Matrix(prior.Psi / (prior.nu + nparam + 1))
+		mu_subs = X * prior.M
+		Lambda_chol = cholesky(Symmetric(prior.Lambda))
+		# inflation_i = 1 + x_i' * Lambda^{-1} * x_i, computed without forming Lambda^{-1}
+		inflations = [1 + dot(X[i,:], Lambda_chol \ X[i,:]) for i = 1:nsub]
+		sigma_subs = [inflations[i] * sigma_mode for i = 1:nsub]
+	end
+
+	# sample candidate starting points from subject 1's prior (matches original behavior)
+	startx = zeros(nstarts, nparam)
+	mvn1 = MvNormal(mu_subs[1,:], sigma_subs[1] isa Diagonal ? sigma_subs[1] : Symmetric(sigma_subs[1]))
 	for j = 1:nstarts
-		#startx[j,:] = rand(MvNormal(vec((X*betas)[1,:]),PDMats.PDMat((Matrix(Diagonal(sigma))),cholesky(Hermitian(Matrix(Diagonal(sigma)))))))
-		startx[j,:] = rand(MvNormal(vec((X*betas)[1,:]),Diagonal(sigma)))		
+		startx[j,:] = rand(mvn1)
 	end
 
 	Threads.@threads for i = 1:nsub
-		sub = subs[i];
-		fitfun = (x) -> gaussianprior(x,(X*betas)[1,:],Diagonal(sigma),view(data,data.sub .== sub,:),likfun)
+		sub = subs[i]
+		mu_i = mu_subs[i,:]
+		sigma_i = sigma_subs[i]
+		fitfun = (x) -> gaussianprior(x, mu_i, sigma_i, view(data, data.sub .== sub, :), likfun)
 
 		for j = 1:nstarts
-			(ll,xx) = optimizesubject(fitfun, startx[j,:]);		
+			(ll, xx) = optimizesubject(fitfun, startx[j,:])
 			if ll < l[i]
 				l[i] = ll
 				x[i,:] = xx
 			end
 		end
-	 end
-	nothing
+	end
 
 	return x
 end
@@ -142,13 +172,17 @@ function estep!(data,subs,startx,x,l,h,X,betas,sigma,likfun)
 	nsub = length(subs)
 	mus = X * betas
 	nparam = size(mus,2)
-		
+
+	# precompute sigma-dependent quantities once (constant across subjects in this E-step)
+	sigma_inv = inv(sigma)
+	logdet_sigma = logdet(sigma)
+
 	Threads.@threads for i = 1:nsub
 		sub = subs[i];
 
-		fitfun = (x) -> gaussianprior(x,mus[i,:],sigma,view(data,data.sub .== sub,:),likfun)
+		fitfun = (x) -> gaussianprior(x, mus[i,:], sigma_inv, logdet_sigma, view(data, data.sub .== sub, :), likfun)
 
-		(l[i], x[i,:]) = optimizesubject(fitfun, startx[i,:]);		
+		(l[i], x[i,:]) = optimizesubject(fitfun, startx[i,:]);
 		hess = y -> ForwardDiff.hessian(fitfun, y);
 
 		h[:,:,i] = inv(hess(x[i,:]));
@@ -161,24 +195,33 @@ function mstep(x,X,h,sigma::Matrix; prior=nothing)
 	# gives same output as more complicated Huys procedure, when design matrix complies with these conditions
 	#
 	# with `prior` (a matrix-normal inverse-Wishart NamedTuple) supplied, this returns the
-	# MAP M-step under that prior. The MAP update for betas is the ridge-regularized solution,
-	# and the MAP update for sigma is the IW posterior mode (treating betas as marginalized
-	# for the denominator). With `prior=nothing` this reduces to the original MLE M-step.
+	# joint MAP M-step under that prior:
+	#   beta_MAP  = (X'X + Λ)^{-1} (X'x + Λ M)
+	#   sigma_MAP = (Ψ + (x - Xβ)'(x - Xβ) + (β - M)'Λ(β - M) + Σ_i h_i)
+	#               / (ν + nsub + nreg + nparam + 1)
+	# (the nreg in the denominator comes from the |Σ|^{-r/2} factor in the matrix-normal
+	# density on β | Σ; this is the strict joint MAP). With `prior=nothing` this reduces
+	# to the original MLE M-step.
 
 	nsub = size(X,1)
 	nparam = size(x,2)
 
-	if prior === nothing
-		betas = inv(X' * X) * X' * x
+	XtX = Symmetric(X' * X)
 
-		newsigma = x' * (I - X * inv(X'*X)*X') * x / nsub + dropdims(mean(h,dims=3),dims=3)
+	if prior === nothing
+		betas = XtX \ (X' * x)
+
+		resid = x - X * betas
+		newsigma = resid' * resid / nsub + dropdims(mean(h, dims=3), dims=3)
 	else
-		betas = (X' * X + prior.Lambda) \ (X' * x + prior.Lambda * prior.M)
+		nreg = size(X, 2)
+		A = Symmetric(Matrix(XtX) + prior.Lambda)
+		betas = A \ (X' * x + prior.Lambda * prior.M)
 
 		resid = x - X * betas
 		beta_dev = betas - prior.M
 		scatter = resid' * resid + beta_dev' * prior.Lambda * beta_dev + dropdims(sum(h, dims=3), dims=3)
-		newsigma = (prior.Psi + scatter) / (prior.nu + nsub + nparam + 1)
+		newsigma = (prior.Psi + scatter) / (prior.nu + nsub + nreg + nparam + 1)
 	end
 
 	if (det(newsigma)<0)
@@ -218,7 +261,8 @@ function emcovmtx(data,subs,x,X,h,betas,sigma,likfun)
 
 	prior = packparams(betas,sigma)
 
-	h1beta = inv(kron(inv(X'*X), sigma))
+	# inv(kron(inv(X'X), sigma)) = kron(X'X, inv(sigma))
+	h1beta = kron(X' * X, inv(sigma))
 	# (in principle this is surely also analytic)
 	h1sigma = ForwardDiff.hessian(newsigma -> mobj(x,X,h,betas,newsigma,nparam), packsigma(sigma))
 	h1 = zeros(length(prior),length(prior))
@@ -228,7 +272,7 @@ function emcovmtx(data,subs,x,X,h,betas,sigma,likfun)
 
 	h2 = ForwardDiff.hessian(newprior -> entropyterm(data,subs,x,X,h,betas,sigma,newprior,likfun), prior)
 
-	return inv(h1-h2)[1:nbetas,1:nbetas]
+	return ((h1 - h2) \ I)[1:nbetas, 1:nbetas]
 end
 
 """
@@ -283,14 +327,17 @@ function mobj(x,X,h,betas,sigma,nparam)
 
 	sigma = unpacksigma(sigma,nparam)
 	mu = X * betas
- 
+
+	sigma_inv = inv(sigma)
+	logdet_sigma = logdet(sigma)
+
  	# eq 7a from Roweis Gaussian cheat sheet
-	return -sum([-1/2 * log(det(sigma)) - 1/2 * ((x[sub,:]-mu[sub,:])' * inv(sigma) * (x[sub,:]-mu[sub,:]) + tr(inv(sigma) * h[:,:,sub] )) for sub in 1:nsub])[1]
+	return -sum([-1/2 * logdet_sigma - 1/2 * (dot(x[sub,:]-mu[sub,:], sigma_inv, x[sub,:]-mu[sub,:]) + tr(sigma_inv * h[:,:,sub])) for sub in 1:nsub])[1]
 end
 
 function entropyterm(data,subs,x,X,h,oldbetas,oldsigma,prior,likfun)
 	# this is the entropy term of the full likelihood, viewed as a function of the prior
-	# for information matrix calculation 
+	# for information matrix calculation
 	# retaining the terms that depend on the prior
 
 	nsub = size(X,1)
@@ -300,24 +347,27 @@ function entropyterm(data,subs,x,X,h,oldbetas,oldsigma,prior,likfun)
     # construct a Gaussian approx to the subject level evidence
 
     (likx,likh) = subjectlikelihood(data,subs,x,X,h,oldbetas,oldsigma,likfun)
-	
+
 	# use this to construct a Gaussian approximation to the subject level posterior
 	# given new top level params
 
 	(betas,sigma) = unpackparams(prior,nreg,nparam)
 	mu = X * betas
- 
- 	hnew = zeros(typeof(betas[1]),nparam,nparam,nsub)
-	xnew = zeros(typeof(betas[1]),nsub,nparam)
+	sigma_inv = inv(sigma)
 
- 	for sub = 1:nsub
-		hnew[:,:,sub] = inv(inv(sigma) + inv(likh[:,:,sub]))
-		xnew[sub,:] = hnew[:,:,sub] * (inv(sigma) * mu[sub,:] + inv(likh[:,:,sub]) * likx[sub,:])
-	end	
-	
-	# finally the expression: log p(x | newbetas, newsigma, data) in expectation over x,h
-	# eq 7a from Roweis Gaussian cheat sheet
-	return -sum([-1/2 * log(det(hnew[:,:,sub])) - 1/2 * ((x[sub,:]-xnew[sub,:])' * inv(hnew[:,:,sub]) * (x[sub,:]-xnew[sub,:]) + tr(inv(hnew[:,:,sub]) * h[:,:,sub] )) for sub in 1:nsub])[1]
+	total = zero(typeof(betas[1]))
+	for sub = 1:nsub
+		likh_inv = inv(likh[:,:,sub])
+		# hnew_inv = inv(hnew) where hnew is the posterior precision. Keep it factored:
+		# log|hnew| = -log|hnew_inv|, hnew*v = hnew_inv \ v
+		hnew_inv = sigma_inv + likh_inv
+		xnew_sub = hnew_inv \ (sigma_inv * mu[sub,:] + likh_inv * likx[sub,:])
+		diff = x[sub,:] - xnew_sub
+		# eq 7a from Roweis Gaussian cheat sheet
+		total += -1/2 * (-logdet(hnew_inv)) - 1/2 * (dot(diff, hnew_inv * diff) + tr(hnew_inv * h[:,:,sub]))
+	end
+
+	return -total
 end
 
 function subjectlikelihood(data,subs,x,X,h,betas,sigma,likfun)
@@ -332,11 +382,12 @@ function subjectlikelihood(data,subs,x,X,h,betas,sigma,likfun)
 	likx = zeros(typeof(betas[1]),nsub,nparam)
 
 	mus = X * betas
+	sigma_inv = inv(sigma)
 
 	for sub = 1:nsub
-		likh[:,:,sub] = inv(inv(h[:,:,sub]) - inv(sigma))
-
-		likx[sub,:] = likh[:,:,sub] * inv(h[:,:,sub]) * (x[sub,:] - h[:,:,sub] * inv(sigma) * mus[sub,:])
+		h_inv = inv(h[:,:,sub])
+		likh[:,:,sub] = inv(h_inv - sigma_inv)
+		likx[sub,:] = likh[:,:,sub] * h_inv * (x[sub,:] - h[:,:,sub] * sigma_inv * mus[sub,:])
 	end
 
 	return(likx,likh)
@@ -368,7 +419,7 @@ function lml(x,l,h)
 		println("Warning: Omitting from LML $n subjects with non-invertible Hessian")
 	end
 
-	return -nparam/2 * log(2*pi) * nsub + sum(l) - sum([log(det(h[:,:,i])) for i in 1:nsub if incsub[i]])/2
+	return -nparam/2 * log(2*pi) * nsub + sum(l) - sum([logdet(h[:,:,i]) for i in 1:nsub if incsub[i]])/2
 end
 
 # aic & bic for group level parameters
@@ -476,12 +527,16 @@ end
 function heldoutsubject_laplace(mu, sigma, data, likfun; startx = mu)
 	nparam = length(mu)
 
-	(lik, params) = optimizesubject((x) -> gaussianprior(x,mu,sigma,data,likfun), startx);
-	
-	hess = ForwardDiff.hessian((x) -> gaussianprior(x,mu,sigma,data,likfun),params);
+	sigma_inv = inv(sigma)
+	logdet_sigma = logdet(sigma)
+	objfun = (x) -> gaussianprior(x, mu, sigma_inv, logdet_sigma, data, likfun)
 
-	lik = -nparam/2 * log(2*pi) + lik + log(det(hess))/2
-	
+	(lik, params) = optimizesubject(objfun, startx)
+
+	hess = ForwardDiff.hessian(objfun, params)
+
+	lik = -nparam/2 * log(2*pi) + lik + logdet(hess)/2
+
 	return(lik)
 end
 
@@ -499,16 +554,19 @@ function freeenergy(x,l,h,X,betas,sigma; prior=nothing)
 		return NaN
 	end
 
+	sigma_inv = inv(sigma)
+	logdet_sigma = logdet(sigma)
+
 	incsub = [det(h[:,:,i]) > 0 for i in 1:nsub]
 
 	fe = (sum([(
 	# MVN Log L (from Wikipedia) terms not involving subject level params x
-	-nparam/2*log(2*pi) - 1/2 * log(det(sigma)) -
+	-nparam/2*log(2*pi) - 1/2 * logdet_sigma -
 	# MVN LogL term involving x, in expectation over x from Eq 7a in Roweis cheat sheet
-	1/2 * ((x[sub,:]-mu[sub,:])' * inv(sigma) * (x[sub,:]-mu[sub,:]) + tr(inv(sigma) * h[:,:,sub] ))
+	1/2 * (dot(x[sub,:]-mu[sub,:], sigma_inv, x[sub,:]-mu[sub,:]) + tr(sigma_inv * h[:,:,sub]))
 	# entropy of hidden variables (from Wikipedia)
 	# these terms also appear in LML below but I think they belong twice
-	+ nparam/2*log(2*pi*exp(1)) + 1/2 * log(det(h[:,:,sub]))
+	+ nparam/2*log(2*pi*exp(1)) + 1/2 * logdet(h[:,:,sub])
 	)
 	for sub in 1:nsub if incsub[sub]])[1]
 	# expected LL for the observations
@@ -535,15 +593,16 @@ function validate_prior(prior, nreg, nparam)
 end
 
 function logprior(betas, sigma, prior)
-	# log p(betas, sigma) under the (decoupled) matrix-normal inverse-Wishart prior,
-	# retaining only terms that depend on betas or sigma. Matches the M-step that uses
-	# the IW posterior mode (denominator nu + nsub + nparam + 1).
+	# log p(betas, sigma) under the matrix-normal inverse-Wishart prior, retaining only
+	# terms that depend on betas or sigma. The -nreg/2 log|Sigma| term comes from the
+	# matrix-normal density on beta|Sigma, which is what makes the M-step strictly the
+	# joint MAP under MNIW (denominator nu + nsub + nreg + nparam + 1).
 
 	nparam = size(sigma, 1)
-	invsigma = inv(sigma)
+	nreg = size(prior.M, 1)
 	beta_dev = betas - prior.M
+	scale = prior.Psi + beta_dev' * prior.Lambda * beta_dev
 
-	return -(prior.nu + nparam + 1)/2 * log(det(sigma)) -
-		   1/2 * tr(invsigma * (prior.Psi + beta_dev' * prior.Lambda * beta_dev))
+	return -(prior.nu + nreg + nparam + 1)/2 * logdet(sigma) - 1/2 * tr(sigma \ scale)
 end
 
