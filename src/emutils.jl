@@ -21,14 +21,22 @@ end
 #	return((a["fun"],a["x"])::Tuple{Float64,Array{Float64,1}})
 #end
 
-function gaussianprior(params,mu,sigma,data,likfun)
+function gaussianprior(params, mu, sigma_inv::AbstractMatrix, logdet_sigma::Real, data, likfun)
+	# fast path: precomputed `inv(sigma)` and `logdet(sigma)` (constant across
+	# all evaluations within a single subject's optimization)
 	d = length(params)
+	diff = params - mu
 
-    lp = -d/2 * log(2*pi) - 1/2 * log(det(sigma)) - 1/2 * (params - mu)' * inv(sigma) * (params - mu)
-	 
+	lp = -d/2 * log(2*pi) - 1/2 * logdet_sigma - 1/2 * dot(diff, sigma_inv, diff)
+
 	nll = likfun(params, data)
-	
-	return (nll - lp[1])
+
+	return nll - lp
+end
+
+function gaussianprior(params, mu, sigma, data, likfun)
+	# backwards-compatible convenience method
+	return gaussianprior(params, mu, inv(sigma), logdet(sigma), data, likfun)
 end
 
 # utilities for packing and unpacking the top level betas and sigmas into a vector (for hessians etc)
