@@ -178,8 +178,8 @@ function estep!(data,subs,startx,x,l,h,X,betas,sigma,likfun)
 	# precompute sigma-dependent quantities once (constant across subjects in this E-step)
 	chol_prec = cholesky(Symmetric(inv(sigma)))
 	logdet_sigma = -2 * sum(log, diag(chol_prec.L))   # from Cholesky, no extra logdet call
-	Pmu_mat = Matrix(chol_prec) * mus                  # (nparam × nsub), one batched multiply
-	mu_Pmu_vec = [dot(mus[i,:], Pmu_mat[:,i]) for i in 1:nsub]
+	Pmu_mat = Matrix(chol_prec) * mus'                  # (nparam × nsub), one batched multiply
+	mu_Pmu_vec = [dot(mus[:,i], Pmu_mat[:,i]) for i in 1:nsub]
 
 	Threads.@threads for i = 1:nsub
 		sub = subs[i];
