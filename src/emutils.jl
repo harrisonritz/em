@@ -27,11 +27,19 @@ function gaussianprior(params, mu, sigma_inv::AbstractMatrix, logdet_sigma::Real
 	d = length(params)
 	diff = params - mu
 
-	lp = -d/2 * log(2*pi) - 1/2 * logdet_sigma - 1/2 * dot(diff, sigma_inv, diff)
+	lp = -d/2 * log(2*pi) - 0.5 * logdet_sigma - 0.5 * dot(diff, sigma_inv, diff)
 
 	nll = likfun(params, data)
 
 	return nll - lp
+end
+
+function gaussianprior(params, mu, chol_prec::Cholesky, logdet_sigma::Real, Pmu, mu_Pmu, data, likfun)
+    d = length(params)
+    z = chol_prec.U * params                                        # triangular multiply, O(d²/2)
+    lp = -d/2 * log(2*pi) - 0.5 * logdet_sigma - 
+         0.5 * (dot(z, z) - 2*dot(Pmu, params) + mu_Pmu)
+    return likfun(params, data) - lp
 end
 
 function gaussianprior(params, mu, sigma, data, likfun)

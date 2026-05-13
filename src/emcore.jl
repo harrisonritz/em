@@ -146,10 +146,12 @@ function eminits(data,subs,X,betas,sigma::Vector,likfun; nstarts=10, prior=nothi
 		startx[j,:] = rand(mvn1)
 	end
 
+
 	Threads.@threads for i = 1:nsub
 		sub = subs[i]
 		mu_i = mu_subs[i,:]
 		sigma_i = sigma_subs[i]
+
 		fitfun = (x) -> gaussianprior(x, mu_i, sigma_i, view(data, data.sub .== sub, :), likfun)
 
 		for j = 1:nstarts
@@ -174,13 +176,15 @@ function estep!(data,subs,startx,x,l,h,X,betas,sigma,likfun)
 	nparam = size(mus,2)
 
 	# precompute sigma-dependent quantities once (constant across subjects in this E-step)
-	sigma_inv = inv(sigma)
-	logdet_sigma = logdet(sigma)
+	chol_prec = cholesky(Symmetric(inv(sigma)))
+	logdet_sigma = -2 * sum(log, diag(chol_prec.L))   # from Cholesky, no extra logdet call
+	Pmu_mat = Matrix(chol_prec) * mus                  # (nparam × nsub), one batched multiply
+	mu_Pmu_vec = [dot(mus[i,:], Pmu_mat[:,i]) for i in 1:nsub]
 
 	Threads.@threads for i = 1:nsub
 		sub = subs[i];
 
-		fitfun = (x) -> gaussianprior(x, mus[i,:], sigma_inv, logdet_sigma, view(data, data.sub .== sub, :), likfun)
+		fitfun = (x) -> gaussianprior(x, mus[i,:], chol_prec, logdet_sigma, view(data, data.sub .== sub, :), likfun)
 
 		(l[i], x[i,:]) = optimizesubject(fitfun, startx[i,:]);
 		hess = y -> ForwardDiff.hessian(fitfun, y);
@@ -206,22 +210,20 @@ function mstep(x,X,h,sigma::Matrix; prior=nothing)
 	nsub = size(X,1)
 	nparam = size(x,2)
 
-	XtX = Symmetric(X' * X)
-
 	if prior === nothing
-		betas = XtX \ (X' * x)
+		betas = X\x
 
 		resid = x - X * betas
 		newsigma = resid' * resid / nsub + dropdims(mean(h, dims=3), dims=3)
 	else
 		nreg = size(X, 2)
-		A = Symmetric(Matrix(XtX) + prior.Lambda)
-		betas = A \ (X' * x + prior.Lambda * prior.M)
+		C = cholesky(Symmetric(prior.Lambda)).U
+		betas = vcat(X, C) \ vcat(x, C * prior.M)
 
 		resid = x - X * betas
 		beta_dev = betas - prior.M
-		scatter = resid' * resid + beta_dev' * prior.Lambda * beta_dev + dropdims(sum(h, dims=3), dims=3)
-		newsigma = (prior.Psi + scatter) / (prior.nu + nsub + nreg + nparam + 1)
+		scatter = resid' * resid + beta_dev'*prior.Lambda*beta_dev + dropdims(sum(h, dims=3), dims=3)
+		newsigma = (prior.Psi + scatter) / (prior.nu + nsub + nreg + nparam)
 	end
 
 	if (det(newsigma)<0)
@@ -332,7 +334,7 @@ function mobj(x,X,h,betas,sigma,nparam)
 	logdet_sigma = logdet(sigma)
 
  	# eq 7a from Roweis Gaussian cheat sheet
-	return -sum([-1/2 * logdet_sigma - 1/2 * (dot(x[sub,:]-mu[sub,:], sigma_inv, x[sub,:]-mu[sub,:]) + tr(sigma_inv * h[:,:,sub])) for sub in 1:nsub])[1]
+	return -sum([-0.5 * logdet_sigma - 0.5 * (dot(x[sub,:]-mu[sub,:], sigma_inv, x[sub,:]-mu[sub,:]) + tr(sigma_inv * h[:,:,sub])) for sub in 1:nsub])[1]
 end
 
 function entropyterm(data,subs,x,X,h,oldbetas,oldsigma,prior,likfun)
@@ -364,7 +366,7 @@ function entropyterm(data,subs,x,X,h,oldbetas,oldsigma,prior,likfun)
 		xnew_sub = hnew_inv \ (sigma_inv * mu[sub,:] + likh_inv * likx[sub,:])
 		diff = x[sub,:] - xnew_sub
 		# eq 7a from Roweis Gaussian cheat sheet
-		total += -1/2 * (-logdet(hnew_inv)) - 1/2 * (dot(diff, hnew_inv * diff) + tr(hnew_inv * h[:,:,sub]))
+		total += -0.5 * (-logdet(hnew_inv)) - 0.5 * (dot(diff, hnew_inv, diff) + tr(hnew_inv * h[:,:,sub]))
 	end
 
 	return -total
@@ -561,12 +563,12 @@ function freeenergy(x,l,h,X,betas,sigma; prior=nothing)
 
 	fe = (sum([(
 	# MVN Log L (from Wikipedia) terms not involving subject level params x
-	-nparam/2*log(2*pi) - 1/2 * logdet_sigma -
+	-nparam/2*log(2*pi) - 0.5 * logdet_sigma -
 	# MVN LogL term involving x, in expectation over x from Eq 7a in Roweis cheat sheet
-	1/2 * (dot(x[sub,:]-mu[sub,:], sigma_inv, x[sub,:]-mu[sub,:]) + tr(sigma_inv * h[:,:,sub]))
+	0.5 * (dot(x[sub,:]-mu[sub,:], sigma_inv, x[sub,:]-mu[sub,:]) + tr(sigma_inv * h[:,:,sub]))
 	# entropy of hidden variables (from Wikipedia)
 	# these terms also appear in LML below but I think they belong twice
-	+ nparam/2*log(2*pi*exp(1)) + 1/2 * logdet(h[:,:,sub])
+	+ nparam/2*log(2*pi*exp(1)) + 0.5 * logdet(h[:,:,sub])
 	)
 	for sub in 1:nsub if incsub[sub]])[1]
 	# expected LL for the observations
@@ -603,6 +605,6 @@ function logprior(betas, sigma, prior)
 	beta_dev = betas - prior.M
 	scale = prior.Psi + beta_dev' * prior.Lambda * beta_dev
 
-	return -(prior.nu + nreg + nparam + 1)/2 * logdet(sigma) - 1/2 * tr(sigma \ scale)
+	return -(prior.nu + nreg + nparam + 1)/2 * logdet(sigma) - 0.5 * tr(sigma \ scale)
 end
 
