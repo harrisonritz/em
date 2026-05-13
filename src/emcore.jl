@@ -135,7 +135,7 @@ function eminits(data,subs,X,betas,sigma::Vector,likfun; nstarts=10, prior=nothi
 		mu_subs = X * prior.M
 		Lambda_chol = cholesky(Symmetric(prior.Lambda))
 		# inflation_i = 1 + x_i' * Lambda^{-1} * x_i, computed without forming Lambda^{-1}
-		inflations = [1 + dot(X[i,:], Lambda_chol \ X[i,:]) for i = 1:nsub]
+		inflations = [1.0 + dot(X[i,:], Lambda_chol \ X[i,:]) for i = 1:nsub]
 		sigma_subs = [inflations[i] * sigma_mode for i = 1:nsub]
 	end
 
@@ -177,14 +177,14 @@ function estep!(data,subs,startx,x,l,h,X,betas,sigma,likfun)
 
 	# precompute sigma-dependent quantities once (constant across subjects in this E-step)
 	chol_prec = cholesky(Symmetric(inv(sigma)))
-	logdet_sigma = -2 * sum(log, diag(chol_prec.L))   # from Cholesky, no extra logdet call
-	Pmu_mat = Matrix(chol_prec) * mus'                  # (nparam × nsub), one batched multiply
+	logdet_sigma = -2.0 * sum(log, diag(chol_prec.L))   # from Cholesky, no extra logdet call
+	Pmu_mat = chol_prec * mus'                        # (nparam × nsub), one batched multiply
 	mu_Pmu_vec = [dot(mus[i,:], Pmu_mat[:,i]) for i in 1:nsub]
 
 	Threads.@threads for i = 1:nsub
 		sub = subs[i];
 
-		fitfun = (x) -> gaussianprior(x, mus[i,:], chol_prec, logdet_sigma, view(data, data.sub .== sub, :), likfun)
+		fitfun = (x) -> gaussianprior(x, mus[i,:], chol_prec, logdet_sigma,  view(Pmu_mat[:,i]), view(mu_Pmu_vec[i]), view(data, data.sub .== sub, :), likfun)
 
 		(l[i], x[i,:]) = optimizesubject(fitfun, startx[i,:]);
 		hess = y -> ForwardDiff.hessian(fitfun, y);
