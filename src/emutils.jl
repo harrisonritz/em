@@ -2,6 +2,7 @@
 
 function _optimizesubject(likfun, startx, ::Val{:forwarddiff})
 	#a = optimize(likfun, startx, NewtonTrustRegion(); autodiff=:forward)
+	# a = optimize(likfun, startx, LBFGS(); autodiff=:forward)
 	a = optimize(likfun, startx, LBFGS(); autodiff=:forward)
 	return (a.minimum, a.minimizer)
 end
@@ -32,14 +33,30 @@ end
 #	return((a["fun"],a["x"])::Tuple{Float64,Array{Float64,1}})
 #end
 
-function gaussianprior(params,mu,sigma,data,likfun)
+function gaussianprior(params, mu, sigma_inv::AbstractMatrix, logdet_sigma::Real, data, likfun)
+	# fast path: precomputed `inv(sigma)` and `logdet(sigma)` (constant across
+	# all evaluations within a single subject's optimization)
 	d = length(params)
+	diff = params - mu
 
-    lp = -d/2 * log(2*pi) - 1/2 * log(det(sigma)) - 1/2 * (params - mu)' * inv(sigma) * (params - mu)
-	 
+	lp = -d/2 * log(2*pi) - 0.5 * logdet_sigma - 0.5 * dot(diff, sigma_inv, diff)
+
 	nll = likfun(params, data)
-	
-	return (nll - lp[1])
+
+	return nll - lp
+end
+
+function gaussianprior(params, mu, chol_prec::Cholesky, logdet_sigma::Real, Pmu, mu_Pmu, data, likfun)
+    d = length(params)
+    z = chol_prec.U * params                                        # triangular multiply, O(d²/2)
+    lp = -d/2 * log(2*pi) - 0.5 * logdet_sigma - 
+         0.5 * (dot(z, z) - 2*dot(Pmu, params) + mu_Pmu)
+    return likfun(params, data) - lp
+end
+
+function gaussianprior(params, mu, sigma, data, likfun)
+	# backwards-compatible convenience method
+	return gaussianprior(params, mu, inv(sigma), logdet(sigma), data, likfun)
 end
 
 # utilities for packing and unpacking the top level betas and sigmas into a vector (for hessians etc)
