@@ -90,13 +90,13 @@ function em(data,subs,X,betas,sigma,likfun; emtol=1e-3, startx = [], maxiter=100
 			end
 			println("\niter: ", iter)
 			println("betas: ", round.(betas,digits=2))
-			if isdiag(sigma)
-				println("sigma: ", round.(diag(sigma),digits=2))
-			else
-				println("sigma: ", round.(sigma,digits=2))
-			end
+			# if isdiag(sigma)
+			# 	println("sigma: ", round.(diag(sigma),digits=2))
+			# else
+			# 	println("sigma: ", round.(sigma,digits=2))
+			# end
 			println("free energy: ", round(freeenergy(x,l,h,X,betas,sigma; prior=prior),digits=6))
-			println("change: ", round.(abs.(newparams-oldparams)./oldparams,digits=6))
+			# println("change: ", round.(abs.(newparams-oldparams)./oldparams,digits=6))
 			println("max: ", round.(maximum(abs.((newparams-oldparams)./oldparams)),digits=6))
 		end
 
@@ -178,18 +178,43 @@ function estep!(data,subs,startx,x,l,h,X,betas,sigma,likfun)
 	# precompute sigma-dependent quantities once (constant across subjects in this E-step)
 	chol_prec = cholesky(Symmetric(inv(sigma)))
 	logdet_sigma = -2.0 * sum(log, diag(chol_prec.L))   # from Cholesky, no extra logdet call
-	Pmu_mat = chol_prec * mus'                        # (nparam × nsub), one batched multiply
+	Pmu_mat = Matrix(chol_prec) * mus'                        # (nparam × nsub), one batched multiply
 	mu_Pmu_vec = [dot(mus[i,:], Pmu_mat[:,i]) for i in 1:nsub]
 
-	Threads.@threads for i = 1:nsub
+	# Threads.@threads for i = 1:nsub
+	for i = 1:nsub
 		sub = subs[i];
 
-		fitfun = (x) -> gaussianprior(x, mus[i,:], chol_prec, logdet_sigma,  view(Pmu_mat[:,i]), view(mu_Pmu_vec[i]), view(data, data.sub .== sub, :), likfun)
+		fitfun = (x) -> gaussianprior(x, mus[i,:], chol_prec, logdet_sigma,  Pmu_mat[:,i], mu_Pmu_vec[i], view(data, data.sub .== sub, :), likfun)
 
 		(l[i], x[i,:]) = optimizesubject(fitfun, startx[i,:]);
 		hess = y -> ForwardDiff.hessian(fitfun, y);
 
 		h[:,:,i] = inv(hess(x[i,:]));
+
+		# try
+
+		# 	# sym_hess = Symmetric(hess(x[i,:]))
+
+		# 	# println("subject ", subs[i], 
+		# 	# " | hess det: ", det(sym_hess), 
+		# 	# " | hess condition= ", eigmax(sym_hess)/eigmin(sym_hess))
+		# catch err
+		# 	println("Error inverting Hessian for subject $i")
+		# 	println("x[i,:] = ", x[i,:])
+		# 	println("l[i] = ", l[i])
+		# 	println("mus[i,:]")
+		# 	display(mus[i,:])
+		# 	println("sigma")
+		# 	display(sigma)
+		# 	println("\ndiag(sigma) = ", diag(sigma))
+		# 	println("hess")
+		# 	display(hess(x[i,:]))
+		# 	print("grad")
+		# 	display(ForwardDiff.gradient(fitfun, x[i,:]))
+
+		# 	throw(err)
+		# end
 	 end
 	nothing
 end
