@@ -1,10 +1,21 @@
 # julia EM model fitting, Nathaniel Daw 8/2019
 
-function optimizesubject(likfun, startx)
+function _optimizesubject(likfun, startx, ::Val{:forwarddiff})
 	#a = optimize(likfun, startx, NewtonTrustRegion(); autodiff=:forward)
 	a = optimize(likfun, startx, LBFGS(); autodiff=:forward)
+	return (a.minimum, a.minimizer)
+end
 
-	return(a.minimum,a.minimizer)
+function _optimizesubject(likfun, startx, ::Val{AD}) where AD
+	error("Unknown autodiff backend :$AD. Supported: :forwarddiff, :enzyme (requires `using Enzyme`).")
+end
+
+function _autodiff_hessian(f, x, ::Val{:forwarddiff})
+	ForwardDiff.hessian(f, x)
+end
+
+function _autodiff_hessian(f, x, ::Val{AD}) where AD
+	error("Unknown autodiff backend :$AD. Supported: :forwarddiff, :enzyme (requires `using Enzyme`).")
 end
 
 # replace the above function with this one to use python optimizer
@@ -12,7 +23,7 @@ end
 # and run single threaded (eg unset JULIA_NUM_THREADS)
 # because this is not thread safe
 
-#function optimizesubject(likfun, startx)
+#function _optimizesubject(likfun, startx, ::Val{:scipy})
 #	# this uses python's optimization function which used to work a little better than julia's
 #	# but is not thread safe
 #	a = so.minimize(likfun, startx, method="L-BFGS-B", jac = (x->ForwardDiff.gradient(likfun,x)))

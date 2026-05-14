@@ -17,6 +17,7 @@ Fit a model using expectation-maximization.
 - `maxiter=100`: maximum EM iterations
 - `quiet=10`: print updates every N iterations (or 0: never)
 - `startx=X*betas`: starting points for per-subject parameters
+- `autodiff=:forwarddiff`: autodiff backend for gradients and Hessians; `:forwarddiff` (default) uses ForwardDiff (forward-over-forward, O(n²) Hessian cost), `:enzyme` uses Enzyme (forward-over-reverse, O(n) Hessian cost — requires `using Enzyme` before calling). Enzyme is preferred for models with many parameters (≳10).
 
 # Returns
 returns `(betas,sigma,x,l,h)`
@@ -26,15 +27,15 @@ returns `(betas,sigma,x,l,h)`
 - `l`: the per-subject likelihoods
 - `h`: the per-subject inverse Hessians
 """
-function em(data,subs,X,betas,sigma::Vector,likfun; emtol=1e-3, startx = [], maxiter=100, quiet=10, full=false)
+function em(data,subs,X,betas,sigma::Vector,likfun; emtol=1e-3, startx = [], maxiter=100, quiet=10, full=false, autodiff=:forwarddiff)
 	if full
-		return em(data,subs,X,betas,Matrix(Diagonal(sigma)),likfun; emtol=emtol, startx = startx, maxiter=maxiter, full=full, quiet=quiet)
+		return em(data,subs,X,betas,Matrix(Diagonal(sigma)),likfun; emtol=emtol, startx = startx, maxiter=maxiter, full=full, quiet=quiet, autodiff=autodiff)
 	else
-		return em(data,subs,X,betas,Diagonal(sigma),likfun; emtol=emtol, startx = startx, maxiter=maxiter, full=full, quiet=quiet)
+		return em(data,subs,X,betas,Diagonal(sigma),likfun; emtol=emtol, startx = startx, maxiter=maxiter, full=full, quiet=quiet, autodiff=autodiff)
 	end
 end
 
-function em(data,subs,X,betas,sigma,likfun; emtol=1e-3, startx = [], maxiter=100, quiet=10, full=false)
+function em(data,subs,X,betas,sigma,likfun; emtol=1e-3, startx = [], maxiter=100, quiet=10, full=false, autodiff=:forwarddiff)
 	nsub = size(X,1)
     nparam = size(betas,2)
 
@@ -62,7 +63,7 @@ function em(data,subs,X,betas,sigma,likfun; emtol=1e-3, startx = [], maxiter=100
 
 	while (true)
 		oldparams = newparams
-		estep!(data,subs,x,x,l,h,X,betas,sigma,likfun) 
+		estep!(data,subs,x,x,l,h,X,betas,sigma,likfun,Val(autodiff))
 		(betas, sigma) = mstep(x,X,h,sigma)
 
 		newparams = packparams(betas,sigma)
@@ -93,7 +94,7 @@ end
 
 # experimental function to generate starting points for em()
 
-function eminits(data,subs,X,betas,sigma::Vector,likfun;nstarts=10)
+function eminits(data,subs,X,betas,sigma::Vector,likfun;nstarts=10, autodiff=:forwarddiff)
 	nsub = size(X,1)
     nparam = size(betas,2)
 
@@ -111,7 +112,7 @@ function eminits(data,subs,X,betas,sigma::Vector,likfun;nstarts=10)
 		fitfun = (x) -> gaussianprior(x,(X*betas)[1,:],Diagonal(sigma),view(data,data.sub .== sub,:),likfun)
 
 		for j = 1:nstarts
-			(ll,xx) = optimizesubject(fitfun, startx[j,:]);		
+			(ll,xx) = _optimizesubject(fitfun, startx[j,:], Val(autodiff))
 			if ll < l[i]
 				l[i] = ll
 				x[i,:] = xx
@@ -127,20 +128,18 @@ end
 
 ### E and M steps
 
-function estep!(data,subs,startx,x,l,h,X,betas,sigma,likfun)
+function estep!(data,subs,startx,x,l,h,X,betas,sigma,likfun,ad=Val(:forwarddiff))
 	nsub = length(subs)
 	mus = X * betas
 	nparam = size(mus,2)
-		
+
 	Threads.@threads for i = 1:nsub
 		sub = subs[i];
 
 		fitfun = (x) -> gaussianprior(x,mus[i,:],sigma,view(data,data.sub .== sub,:),likfun)
 
-		(l[i], x[i,:]) = optimizesubject(fitfun, startx[i,:]);		
-		hess = y -> ForwardDiff.hessian(fitfun, y);
-
-		h[:,:,i] = inv(hess(x[i,:]));
+		(l[i], x[i,:]) = _optimizesubject(fitfun, startx[i,:], ad)
+		h[:,:,i] = inv(_autodiff_hessian(fitfun, x[i,:], ad))
 	 end
 	nothing
 end
@@ -179,7 +178,7 @@ end
 
 #### functions related to error bars
 
-function emcovmtx(data,subs,x,X,h,betas,sigma,likfun)
+function emcovmtx(data,subs,x,X,h,betas,sigma,likfun,ad=Val(:forwarddiff))
   	# compute covariance on the group level model parameters using missing information
     # this version from http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.442.7750&rep=rep1&type=pdf
     # Tagare "A gentle introduction to the EM algorithm"
@@ -195,13 +194,13 @@ function emcovmtx(data,subs,x,X,h,betas,sigma,likfun)
 
 	h1beta = inv(kron(inv(X'*X), sigma))
 	# (in principle this is surely also analytic)
-	h1sigma = ForwardDiff.hessian(newsigma -> mobj(x,X,h,betas,newsigma,nparam), packsigma(sigma))
+	h1sigma = _autodiff_hessian(newsigma -> mobj(x,X,h,betas,newsigma,nparam), packsigma(sigma), ad)
 	h1 = zeros(length(prior),length(prior))
 	h1[1:nbetas,1:nbetas] = h1beta
 	h1[nbetas+1:end,nbetas+1:end] = h1sigma
 	#h1 = h1 * (nsub-nreg) / nsub # bias correction
 
-	h2 = ForwardDiff.hessian(newprior -> entropyterm(data,subs,x,X,h,betas,sigma,newprior,likfun), prior)
+	h2 = _autodiff_hessian(newprior -> entropyterm(data,subs,x,X,h,betas,sigma,newprior,likfun), prior, ad)
 
 	return inv(h1-h2)[1:nbetas,1:nbetas]
 end
@@ -231,12 +230,12 @@ as a vector, `vec(betas')` for the purpose of this function. This determines the
 `pvalues` and the arrangement of `covmtx`. You can rebuild them back into the shape of `betas``
 using, e.g., `reshape(pvalues,size(betas'))'` 
 """
-function emerrors(data,subs,x,X,h,betas,sigma,likfun)
+function emerrors(data,subs,x,X,h,betas,sigma,likfun; autodiff=:forwarddiff)
     nsub = size(X,1)
     nreg = size(X,2)
     nparam = size(betas,2)
 
- 	covmtx = emcovmtx(data,subs,x,X,h,betas,sigma,likfun)
+ 	covmtx = emcovmtx(data,subs,x,X,h,betas,sigma,likfun,Val(autodiff))
 
 	ses = sqrt.([diag(covmtx)[i] .< 0 ? NaN : diag(covmtx)[i] for i in 1:length(diag(covmtx))])
 
@@ -406,8 +405,9 @@ approximation to marginalize the subject-level parameters.
 - `emtol=1e-3`: stopping point tolerance for relative change in parameters
 - `full=false`: use a full (vs. diagonal) group-level covariance
 - `maxiter=100`: maximum EM iterations per-subject
-""" 
-function loocv(data,subs,startx,X,betas,sigma,likfun;emtol=1e-3, full=false, maxiter=100)
+- `autodiff=:forwarddiff`: autodiff backend (`:forwarddiff` or `:enzyme`); passed through to `em()` and heldout Laplace approximation
+"""
+function loocv(data,subs,startx,X,betas,sigma,likfun;emtol=1e-3, full=false, maxiter=100, autodiff=:forwarddiff)
 	nsub = size(X,1)
 
 	liks = zeros(nsub)
@@ -434,10 +434,10 @@ function loocv(data,subs,startx,X,betas,sigma,likfun;emtol=1e-3, full=false, max
 		end
 
 		try
-			(newbetas,newsigma,~,~,~) = em(data,loosubs,looX,betas,sigma,likfun; emtol=emtol, startx=loostartx, full=full, maxiter=maxiter, quiet=true)
+			(newbetas,newsigma,~,~,~) = em(data,loosubs,looX,betas,sigma,likfun; emtol=emtol, startx=loostartx, full=full, maxiter=maxiter, quiet=true, autodiff=autodiff)
 			newmu = newbetas' * X[i,:]
 
-			liks[i] = heldoutsubject_laplace(newmu,newsigma,data[data[:,:sub] .== sub,:],likfun;startx = startx[i,:])
+			liks[i] = heldoutsubject_laplace(newmu,newsigma,data[data[:,:sub] .== sub,:],likfun; startx = startx[i,:], ad = Val(autodiff))
 		catch err
 	 		println(err)
 	 		liks[i] = NaN
@@ -447,15 +447,16 @@ function loocv(data,subs,startx,X,betas,sigma,likfun;emtol=1e-3, full=false, max
 	return(liks)
 end
 
-function heldoutsubject_laplace(mu, sigma, data, likfun; startx = mu)
+function heldoutsubject_laplace(mu, sigma, data, likfun; startx = mu, ad = Val(:forwarddiff))
 	nparam = length(mu)
 
-	(lik, params) = optimizesubject((x) -> gaussianprior(x,mu,sigma,data,likfun), startx);
-	
-	hess = ForwardDiff.hessian((x) -> gaussianprior(x,mu,sigma,data,likfun),params);
+	fitfun = (x) -> gaussianprior(x,mu,sigma,data,likfun)
+	(lik, params) = _optimizesubject(fitfun, startx, ad)
+
+	hess = _autodiff_hessian(fitfun, params, ad)
 
 	lik = -nparam/2 * log(2*pi) + lik + log(det(hess))/2
-	
+
 	return(lik)
 end
 
